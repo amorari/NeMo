@@ -374,3 +374,252 @@ def build_visual_engine(
         build_video_neva_engine(model_dir, visual_checkpoint_path, vision_max_batch_size)
     else:
         raise RuntimeError(f"Invalid model type {model_type}")
+
+
+
+from nemo.collections.multimodal.speech_llm.models.modular_models import ModularAudioGPTModel
+from nemo.collections.nlp.parts.megatron_trainer_builder import MegatronTrainerBuilder
+from nemo.core.config import hydra_runner
+from nemo.utils import logging
+
+def build_audio_engine(
+    model_dir: str,
+    audio_checkpoint_path: str,
+    model_type: str = "salm",
+
+):
+    # Placeholder for supported model list
+    model_list = ['salm']
+    
+    if model_type not in model_list:
+        raise RuntimeError(f"Invalid model type {model_type}")
+
+    # Load and export the audio model components
+    #export_audio_components_to_onnx(audio_checkpoint_path, model_dir)
+    
+    # Build the TensorRT engines
+    build_audio_trt_engines(model_dir)
+
+def build_audio_trt_engines(
+    output_dir,
+):
+    part_name = 'encoder'
+    onnx_file = '%s/%s.onnx' % (output_dir, part_name)
+    config_file = '%s/%s' % (output_dir, "config.json")
+    engine_file = '%s/%s.trt' % (output_dir, part_name)
+    nemo_config_file = '%s/%s' % (output_dir, "config.yaml")
+
+    logger.log(trt.Logger.INFO, "Building TRT engine for %s" % part_name)
+
+    #Create configuration
+    with open(nemo_config_file, 'r') as file:
+        nemo_config = yaml.safe_load(file)
+
+    # Precision
+    precision = nemo_config['trainer']['precision']
+    if precision == 'bf16':
+        precision = 'bfloat16' 
+    elif precision == 'fp16':
+        precision = 'float16' 
+    else:
+        precision = 'float32' 
+
+    # Other relevant parameters
+    max_workspace_size = 1 << 30  # 1GB, adjust as needed
+    max_batch_size = nemo_config['model']['global_batch_size']
+
+    builder = trt.Builder(logger)
+    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+
+    config_args = {"precision": precision, "max_batch_size": max_batch_size}
+    config_wrapper = Builder().create_builder_config(**config_args)
+    config = config_wrapper.trt_builder_config
+
+    if precision == trt.DataType.HALF:
+        config.set_flag(trt.BuilderFlag.FP16)
+    elif precision == trt.DataType.BF16:
+        config.set_flag(trt.BuilderFlag.BF16)
+
+    # Set other flags based on your YAML configuration
+    #if nemo_config['model'].get('tensor_model_parallel_size', 1) > 1:
+    #    config.set_flag(trt.BuilderFlag.SPARSE_WEIGHTS)
+
+    #if nemo_config['trainer'].get('gradient_clip_val', 0.0) > 0:
+    #    nemo_config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+    parser = trt.OnnxParser(network, logger)
+
+    with open(onnx_file, 'rb') as model:
+        if not parser.parse(model.read(), os.path.abspath(onnx_file)):
+            logger.log(trt.Logger.ERROR, "Failed parsing %s" % onnx_file)
+            for error in range(parser.num_errors):
+                logger.log(trt.Logger.ERROR, parser.get_error(error))
+        else:
+            logger.log(trt.Logger.INFO, "Succeeded parsing %s" % onnx_file)
+
+    #profile = builder.create_optimization_profile()
+    #input_tensor = network.get_input(0)
+    #profile.set_shape(input_tensor.name, (1, 1, 256), (1, 128, 256), (max_batch_size, 256, 256))
+    #config.add_optimization_profile(profile)
+
+    t0 = time()
+    engine_string = builder.build_serialized_network(network, config)
+    t1 = time()
+    if engine_string is None:
+        raise RuntimeError("Failed building %s" % (engine_file))
+    else:
+        logger.log(trt.Logger.INFO, "Succeeded building %s in %d s" % (engine_file, t1 - t0))
+        with open(engine_file, 'wb') as f:
+            f.write(engine_string)
+
+    Builder.save_config(config_wrapper, config_file)
+
+def export_audio_components_to_onnx(audio_checkpoint_path: str, model_dir: str):
+    # Load configuration
+    #cfg = load_audio_config()  # Placeholder function to load configuration
+    cfg = []
+
+    trainer = MegatronTrainerBuilder(cfg).create_trainer()
+    model = load_audio_model(cfg, trainer, audio_checkpoint_path)
+    
+    model.eval()
+
+    # Export each component
+    components = {
+        "preprocessor": model.preprocessor,
+        "encoder": model.encoder,
+        "modality_adapter": model.modality_adapter,
+        "decoder": model.decoder,
+    }
+
+    for component_name, component in components.items():
+        export_audio_component_to_onnx(component, model_dir, component_name)
+
+def load_audio_model(cfg, trainer, audio_checkpoint_path):
+    if cfg.model.from_pretrained:
+        model_cfg = ModularAudioGPTModel.from_pretrained(
+            cfg.model.from_pretrained, trainer=trainer, return_config=True
+        )
+        model_cfg = ModularAudioGPTModel.merge_inference_cfg(cfg, trainer, model_cfg)
+        model_file = ModularAudioGPTModel.from_pretrained(
+            cfg.model.from_pretrained, trainer=trainer, return_model_file=True
+        )
+        model = ModularAudioGPTModel.restore_from(
+            restore_path=model_file,
+            trainer=trainer,
+            override_config_path=model_cfg,
+            strict=False,
+            map_location="cpu",
+        )
+        if "peft" in model_cfg and model_cfg.peft.get("peft_scheme", None):
+            model.load_adapters(model_file, map_location="cpu")
+    else:
+        model_cfg = ModularAudioGPTModel.merge_inference_cfg(cfg, trainer)
+        model = ModularAudioGPTModel.restore_from(
+            restore_path=audio_checkpoint_path,
+            trainer=trainer,
+            override_config_path=model_cfg,
+            strict=False,
+            map_location="cpu",
+        )
+        model = ModularAudioGPTModel.load_adapters_for_inference(cfg, model_cfg, model)
+        model = ModularAudioGPTModel.load_audio_encoder_for_inference(cfg, model_cfg, model)
+    
+    return model
+
+def export_audio_component_to_onnx(component, model_dir, component_name):
+    output_path = os.path.join(model_dir, f"{component_name}.onnx")
+    dummy_input = component.input_example(max_batch=8, max_dim=32000)  # Adjust input example as needed
+    torch.onnx.export(
+        component,
+        dummy_input,
+        output_path,
+        opset_version=17,
+        input_names=['input'],
+        output_names=['output'],
+        dynamic_axes={'input': {0: 'batch'}, 'output': {0: 'batch'}}
+    )
+    print(f"Exported {component_name} to {output_path}")
+
+
+@hydra_runner(config_path="conf", config_name="export_to_onnx_config_eval")
+def export_audio_engines(cfg) -> None:
+
+    trainer = MegatronTrainerBuilder(cfg).create_trainer()
+
+    if cfg.model.from_pretrained:
+        # Load model from NGC or HuggingFace
+        logging.info(f"Loading model from cloud: {cfg.model.from_pretrained}")
+        model_cfg = ModularAudioGPTModel.from_pretrained(
+            cfg.model.from_pretrained, trainer=trainer, return_config=True
+        )
+        model_cfg = ModularAudioGPTModel.merge_inference_cfg(cfg, trainer, model_cfg)
+        model_file = ModularAudioGPTModel.from_pretrained(
+            cfg.model.from_pretrained, trainer=trainer, return_model_file=True
+        )
+        model = ModularAudioGPTModel.restore_from(
+            restore_path=model_file,
+            trainer=trainer,
+            override_config_path=model_cfg,
+            strict=False,
+            map_location="cpu",
+        )
+        if "peft" in model_cfg and model_cfg.peft.get("peft_scheme", None):
+            # need this due to the way that MegatronGPTSFTModel doesn't load adapters in model initialization
+            model.load_adapters(model_file, map_location="cpu")
+    else:
+        # Load model from a local file
+        model_cfg = ModularAudioGPTModel.merge_inference_cfg(cfg, trainer)
+        model = ModularAudioGPTModel.restore_from(
+            restore_path=cfg.model.restore_from_path,
+            trainer=trainer,
+            override_config_path=model_cfg,
+            strict=False,
+            map_location="cpu",
+        )
+        model = ModularAudioGPTModel.load_adapters_for_inference(cfg, model_cfg, model)
+        model = ModularAudioGPTModel.load_audio_encoder_for_inference(cfg, model_cfg, model)
+
+    model.eval()
+
+    #Export the models
+
+    models_to_export = {
+        'modality_adapter' : model.perception.modality_adapter,
+        'audio_encoder' : model.perception.encoder,
+    }
+
+    engine_path = f"onnx/"
+    for tag, model_to_export in models_to_export.items():
+        model_name = model_to_export.__class__.__name__ 
+        model_path = f"{engine_path}/{cfg.model.export_to_path}_{model_name}_{tag}"
+
+        logging.info("################################################################################")
+        logging.info(f"Exporting to {model_path}...")
+
+        os.makedirs(model_path, exist_ok=True)
+        model_file_path= f"{model_path}/model.onnx"
+        
+        #NOTE: Export fails with max_dim>4096 probably due to memory alloc error
+        input_example = model_to_export.input_example(max_batch = 8, max_dim = 4096) 
+
+        model_to_export.export(
+            output=model_file_path,
+            input_example=input_example,
+            verbose=False,
+            onnx_opset_version=17,
+            dynamic_axes={},
+        )
+
+        # Save the config to a json file
+        config_file_path= f"{model_path}/config.json"
+        config_dict = OmegaConf.to_container(cfg.model, resolve=False)
+        json_config = json.dumps(config_dict, indent=4)
+
+        with open(config_file_path, "w") as json_file:
+            json_file.write(json_config)
+
+
+print("Starting")
+build_audio_engine('./audio_model','./speechllm_fc_llama2_7b.nemo','salm')
+
+    
