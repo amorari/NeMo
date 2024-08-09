@@ -392,7 +392,8 @@ def build_multimodal_engine(
     model_type: str = "neva",
     max_batch_size: int = 1,
 ):
-    model_list = ['neva', 'lita', 'vila', 'vita', 'salm']
+    print('model type: ' + model_type)
+    model_list = ['neva', 'lita', 'vila', 'vita']
     if model_type in model_list:
         build_neva_engine(model_type, model_dir, checkpoint_path, max_batch_size)
     elif model_type == "video-neva":
@@ -414,16 +415,15 @@ def build_salm_engine(
 
     #Load main nemo config
     with open(f'{nemo_dir}/config.yaml') as f:
-        nemo_config = OmegaConf.load
-    perception_config = nemo_config['perception']
+        nemo_config = OmegaConf.load(f)
 
-    # Load the perception model
+    # Load the perception weights
     perception_state_dict = load_state_dict_from_nemo(
-        nemo_dir= nemo_dir,
+        nemo_dir= f'{nemo_dir}/perception',
         map_location= device)
 
     #TODO: Using Nemo code here, need to rewrite the preprocessor to be exportable to TensorRT
-    perception = AudioPerceptionModule(cfg=perception_config)
+    perception = AudioPerceptionModule(cfg=nemo_config.perception)
     perception.load_state_dict(perception_state_dict)
     # verify if the exported perception model is correct
     perception.eval()
@@ -449,8 +449,8 @@ def build_salm_engine(
             encoded = self.proj(encoded.transpose(1, 2))
             return encoded, encoded_len
 
-    if 'output_dim' not in perception_config.modality_adapter and "d_model" in perception_config.modality_adapter:  # e.g., conformer encoder
-        proj = nn.Linear(perception_config.modality_adapter.d_model, perception_config.output_dim)
+    if 'output_dim' not in nemo_config.perception.modality_adapter and "d_model" in nemo_config.perception.modality_adapter:  # e.g., conformer encoder
+        proj = nn.Linear(nemo_config.perception.modality_adapter.d_model, nemo_config.perception.output_dim)
     else:
         proj = nn.Identity()         
 
@@ -460,7 +460,7 @@ def build_salm_engine(
         projector= proj)
 
     #Test with dummy input
-    input_features = perception_config.encoder.feat_in
+    input_features = nemo_config.perception.encoder.feat_in
     processed_signal = torch.randn(1, input_features, 128)
     processed_signal_length = torch.tensor([128])
     print(f"Encoders Wrapper input features: {input_features}")
@@ -482,7 +482,7 @@ def build_salm_engine(
         )
     
     build_salm_encoder_engine(
-        nemo_config= perception_config,
+        nemo_config= nemo_config,
         engine_dir = f'{model_dir}/encoder',
         onnx_file= onnx_file,
         dtype= dtype,
@@ -496,7 +496,7 @@ def build_salm_engine(
     #TODO: read these values from a config file
     build_salm_decoder_engine(
         engine_dir=f'{model_dir}/decoder',
-        nemo_checkpoint_path=f'{nemo_dir}/decoder.nemo',
+        nemo_checkpoint_path=f'{nemo_dir}/llm.nemo',
         llm_model_type = "llama",
         tensor_parallelism_size = nemo_config['tensor_model_parallel_size'],
         max_input_len = 512,
@@ -605,6 +605,8 @@ def build_salm_encoder_engine(
     network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
 
     config_args = nemo_config
+    config_args['precision'] = dtype
+
     config_wrapper = Builder().create_builder_config(**config_args)
     config = config_wrapper.trt_builder_config
 
@@ -633,8 +635,8 @@ def build_salm_encoder_engine(
 
     min_batch_size = 1
     opt_batch_size = max(min_batch_size,int(max_batch_size/2))
-    input_features = nemo_config['perception']['encoder']['feat_in']
-    max_length = nemo_config['encoder_seq_length']
+    input_features = nemo_config.perception.encoder.feat_in
+    max_length = nemo_config.encoder_seq_length
 
     # Processed_input shape
     min_processed_input_dims = (min_batch_size, input_features, 1)

@@ -37,10 +37,6 @@ def get_precision_from_checkpoint(state_dict):
             cnt += 1
         if cnt == 100:
             break
-        #check if dtype did not change from before
-        if dtype is not None and str(param.dtype) != dtype:
-            print("Different dtypes found in the checkpoint.")
-        dtype = str(param.dtype)
 
     # Assuming all parameters have the same dtype, we can return the dtype of the last parameter
     if (param is not None):
@@ -139,7 +135,7 @@ def save_llm_model(state_dict, nemo_config, output_path):
     model.save_to(output_path)
     logging.info(f'llm model saved to: {output_path}')
 
-def save_nemo_weights(state_dict, config, output_dir, tar_nemo_model=True):
+def save_nemo_component(state_dict, config, output_dir, tar_nemo_model=True):
     if not os.path.exists(output_dir):
         os.mkdir(output_dir)
     weight_file = os.path.join(output_dir,"model_weights.ckpt")
@@ -155,7 +151,7 @@ def save_nemo_weights(state_dict, config, output_dir, tar_nemo_model=True):
         # tar model_config.yaml and model_weights.ckpt
         os.system(f"tar -C {output_dir} -cvf {nemo_path} model_config.yaml model_weights.ckpt")
         # remove model_config.yaml and model_weights.ckpt
-        os.system(f"rm {weight_file}")
+        os.system(f"rm {config_file} {weight_file}")
         # remove the empty directory
         os.system(f"rmdir {output_dir}")
 
@@ -178,11 +174,11 @@ def separate_speechllm_model(model_file_path, output_dir, map_location="cuda:0")
     perception_state_dict = get_perception_state_dict(state_dict)
     perception_model_dir = None
     if perception_state_dict:
-        perception_model_dir = f"{base_model_name}_perception"
+        perception_model_dir = "perception"
         perception_model_dir = os.path.join(output_dir, perception_model_dir)
         #Add precision to perception configuration
         conf.perception['dtype'] = get_precision_from_checkpoint(perception_state_dict)
-        save_nemo_weights(perception_state_dict, conf.perception, perception_model_dir, tar_nemo_model=False)
+        save_nemo_component(perception_state_dict, conf.perception, perception_model_dir, tar_nemo_model=False)
     
         # verify if the exported perception model is correct
         perception = AudioPerceptionModule(cfg=conf.perception)
@@ -196,14 +192,14 @@ def separate_speechllm_model(model_file_path, output_dir, map_location="cuda:0")
     lora_state_dict = get_lora_state_dict(state_dict)
     lora_model_dir = None
     if lora_state_dict:
-        lora_model_dir = f"{base_model_name}_lora"
+        lora_model_dir = f"lora"
         lora_model_dir = os.path.join(output_dir, lora_model_dir)
-        save_nemo_weights(lora_state_dict, conf, lora_model_dir)
+        save_nemo_component(lora_state_dict, conf, lora_model_dir)
         logging.info(f"Lora model saved to: {lora_model_dir}.nemo")
     # hard code the target model for now
     llm_model_weights = get_llm_model_state_dict(state_dict, lora_state_dict)
     if llm_model_weights:
-        llm_model = f"{base_model_name}_llm.nemo"
+        llm_model = f"llm.nemo"
         llm_model = os.path.join(output_dir, llm_model)
         conf.target = "nemo.collections.nlp.models.language_modeling.megatron_gpt_model.MegatronGPTModel"
         conf['llm_dtype'] = get_precision_from_checkpoint(lora_state_dict)
