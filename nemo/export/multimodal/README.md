@@ -13,9 +13,9 @@ python3 separate_salm_weights.py --model_file_path=speechllm_fc_llama2_7b.nemo -
 ```
 It takes a while to run the above command.
 
-Under the `output` dir, you'll see:
+Under the `nemo_output` dir, you'll see:
 ```
-output
+nemo_output
     |___config.yaml
     |___speechllm_fc_llama2_7b_lora.nemo
     |___speechllm_fc_llama2_7b_perception
@@ -31,14 +31,8 @@ python /opt/NeMo/scripts/nlp_language_modeling/merge_lora_weights/merge.py \
     trainer.accelerator=gpu \
     tensor_model_parallel_size=1 \
     pipeline_model_parallel_size=1 \
-    gpt_model_file=output/speechllm_fc_llama2_7b_llm.nemo \
-    lora_model_path=output/speechllm_fc_llama2_7b_lora.nemo \
-    merged_model_path=speechllm_fc_llama2_7b_llm_merged.nemo
+    gpt_model_file=nemo_output/speechllm_fc_llama2_7b_llm.nemo \
+    lora_model_path=nemo_output/speechllm_fc_llama2_7b_lora.nemo \
+    merged_model_path=nemo_output/speechllm_fc_llama2_7b_llm_merged.nemo
 ```
 
-Now we are able to export the engine by:
-```
-python3 export_salm.py \
-    model.perception_model_path=output/speechllm_fc_llama2_7b_perception \
-    model.llm_model_path=output/speechllm_fc_llama2_7b_llm_merged.nemo
-```
