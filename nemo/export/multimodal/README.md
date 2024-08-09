@@ -1,3 +1,10 @@
+## Setting up the environment
+This code needs to be executed with both Nemo and TRT-LLM support. This container can be used to execute it:
+
+gitlab-master.nvidia.com:5005/dl/joc/nemo-ci/trtllm_0.11/train:pipe.16718524-x86
+
+You can also rerun ./reinstall.sh in Nemo so that the nemo package is using the current Nemo folder.
+
 ## Separate Nemo components
 In this part, we are going to export SALM model into TRTLLM.
 First, let's download the [SALM nemo model](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/nemo/models/speechllm_fc_llama2_7b/) from NVIDIA ngc.
