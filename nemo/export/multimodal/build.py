@@ -482,7 +482,7 @@ def build_salm_engine(
         )
     
     build_salm_encoder_engine(
-        nemo_config= nemo_config,
+        nemo_config= OmegaConf.to_container(nemo_config),
         engine_dir = f'{model_dir}/encoder',
         onnx_file= onnx_file,
         dtype= dtype,
@@ -594,8 +594,8 @@ def build_salm_encoder_engine(
     max_batch_size,
 ):
 
-    output_config_file = f'{engine_dir}/config.json',
-    output_engine_file = f'{engine_dir}/rank0.trt',
+    output_config_file = f'{engine_dir}/config.json'
+    output_engine_file = f'{engine_dir}/rank0.trt'
     logger.log(trt.Logger.INFO, "Building TRT encoder engine ")
 
    # Other relevant parameters
@@ -605,7 +605,6 @@ def build_salm_encoder_engine(
     network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
 
     config_args = nemo_config
-    config_args['precision'] = dtype
 
     config_wrapper = Builder().create_builder_config(**config_args)
     config = config_wrapper.trt_builder_config
@@ -635,8 +634,8 @@ def build_salm_encoder_engine(
 
     min_batch_size = 1
     opt_batch_size = max(min_batch_size,int(max_batch_size/2))
-    input_features = nemo_config.perception.encoder.feat_in
-    max_length = nemo_config.encoder_seq_length
+    input_features = nemo_config['perception']['encoder']['feat_in']
+    max_length = nemo_config['encoder_seq_length']
 
     # Processed_input shape
     min_processed_input_dims = (min_batch_size, input_features, 1)
