@@ -49,4 +49,14 @@ python /opt/NeMo/scripts/nlp_language_modeling/merge_lora_weights/merge.py \
 python build.py --model_dir trt_engines --checkpoint_path nemo_model --model_type salm --max_batch_size 1
 ```
 
+After we should obtain the engines as follows:
+
+trt_engines
+    |___encoder
+    |       |____config.json
+    |       |____rank0.trt
+    |___decoder
+            |____config.json
+            |____rank0.trt
+
 
