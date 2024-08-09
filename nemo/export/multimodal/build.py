@@ -22,15 +22,18 @@ from time import time
 
 import tensorrt as trt
 import torch
+import torch.nn as nn
 import yaml
 from tensorrt_llm.builder import Builder
 from transformers import AutoModel
+from omegaconf.omegaconf import OmegaConf
 
 from nemo.export.tensorrt_llm import TensorRTLLM
 from nemo.export.trt_llm.nemo_ckpt_loader.nemo_file import load_nemo_model
+from nemo.collections.multimodal.speech_llm.modules.perception_modules import AudioPerceptionModule
+from nemo.core.classes.common import typecheck
 
 logger = trt.Logger(trt.Logger.INFO)
-
 
 def build_trtllm_engine(
     model_dir: str,
@@ -59,6 +62,29 @@ def build_trtllm_engine(
         load_model=False,
     )
 
+def build_salm_decoder_engine(
+    engine_dir: str,
+    nemo_checkpoint_path: str,
+    llm_model_type: str = "llama",
+    tensor_parallelism_size: int = 1,
+    max_input_len: int = 256,
+    max_output_len: int = 256,
+    max_batch_size: int = 1,
+    max_multimodal_len: int = 1024,
+    dtype: str = "bfloat16",
+):
+    trt_llm_exporter = TensorRTLLM(model_dir=engine_dir, load_model=False)
+    trt_llm_exporter.export(
+        nemo_checkpoint_path= nemo_checkpoint_path,
+        model_type=llm_model_type,
+        tensor_parallelism_size=tensor_parallelism_size,
+        max_input_len=max_input_len,
+        max_output_len=max_output_len,
+        max_batch_size=max_batch_size,
+        max_prompt_embedding_table_size=max_multimodal_len,
+        dtype=dtype,
+        load_model=False,
+    )
 
 def export_visual_wrapper_onnx(
     visual_wrapper, input, output_dir, input_names=['input'], dynamic_axes={'input': {0: 'batch'}}
@@ -360,84 +386,231 @@ def build_video_neva_engine(
         num_frames=num_frames,
     )
 
-
-def build_visual_engine(
+def build_multimodal_engine(
     model_dir: str,
-    visual_checkpoint_path: str,
+    checkpoint_path: str,
     model_type: str = "neva",
-    vision_max_batch_size: int = 1,
+    max_batch_size: int = 1,
 ):
-    model_list = ['neva', 'lita', 'vila', 'vita']
+    model_list = ['neva', 'lita', 'vila', 'vita', 'salm']
     if model_type in model_list:
-        build_neva_engine(model_type, model_dir, visual_checkpoint_path, vision_max_batch_size)
+        build_neva_engine(model_type, model_dir, checkpoint_path, max_batch_size)
     elif model_type == "video-neva":
-        build_video_neva_engine(model_dir, visual_checkpoint_path, vision_max_batch_size)
+        build_video_neva_engine(model_dir, checkpoint_path, max_batch_size)
+    elif model_type == "salm":
+        build_salm_engine(model_dir, checkpoint_path, max_batch_size, dtype='bfloat16')
     else:
         raise RuntimeError(f"Invalid model type {model_type}")
 
 
 
-from nemo.collections.multimodal.speech_llm.models.modular_models import ModularAudioGPTModel
-from nemo.collections.nlp.parts.megatron_trainer_builder import MegatronTrainerBuilder
-from nemo.core.config import hydra_runner
-from nemo.utils import logging
-
-def build_audio_engine(
+def build_salm_engine(
     model_dir: str,
-    audio_checkpoint_path: str,
-    model_type: str = "salm",
-
+    nemo_dir: str,
+    max_batch_size: int,
+    dtype: str = "bfloat16",
 ):
-    # Placeholder for supported model list
-    model_list = ['salm']
-    
-    if model_type not in model_list:
-        raise RuntimeError(f"Invalid model type {model_type}")
+    device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
 
-    # Load and export the audio model components
-    #export_audio_components_to_onnx(audio_checkpoint_path, model_dir)
-    
-    # Build the TensorRT engines
-    build_audio_trt_engines(model_dir)
+    #Load main nemo config
+    with open(f'{nemo_dir}/config.yaml') as f:
+        nemo_config = OmegaConf.load
+    perception_config = nemo_config['perception']
 
-def build_audio_trt_engines(
-    output_dir,
-):
-    part_name = 'encoder'
-    onnx_file = '%s/%s.onnx' % (output_dir, part_name)
-    config_file = '%s/%s' % (output_dir, "config.json")
-    engine_file = '%s/%s.trt' % (output_dir, part_name)
-    nemo_config_file = '%s/%s' % (output_dir, "config.yaml")
+    # Load the perception model
+    perception_state_dict = load_state_dict_from_nemo(
+        nemo_dir= nemo_dir,
+        map_location= device)
 
-    logger.log(trt.Logger.INFO, "Building TRT engine for %s" % part_name)
+    #TODO: Using Nemo code here, need to rewrite the preprocessor to be exportable to TensorRT
+    perception = AudioPerceptionModule(cfg=perception_config)
+    perception.load_state_dict(perception_state_dict)
+    # verify if the exported perception model is correct
+    perception.eval()
+    print(perception(input_signal = torch.randn(1, 1000), input_signal_length = torch.tensor([1000])))
 
-    #Create configuration
-    with open(nemo_config_file, 'r') as file:
-        nemo_config = yaml.safe_load(file)
+    class EncodersModuleWrapper(torch.nn.Module):
+        def __init__(self, encoder, modality_adapter, projector):
+            super().__init__()
+            self.encoder = encoder
+            self.modality_adapter = modality_adapter
+            self.proj = projector
 
-    # Precision
-    precision = nemo_config['trainer']['precision']
-    if precision == 'bf16':
-        precision = 'bfloat16' 
-    elif precision == 'fp16':
-        precision = 'float16' 
+        @typecheck.disable_checks()
+        def forward(
+            self,
+            processed_signal=None,
+            processed_signal_length=None,
+        ):
+            encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+            encoded, encoded_len = self.modality_adapter(audio_signal=encoded, length=encoded_len)
+
+            # b, c, t -> b, t, c
+            encoded = self.proj(encoded.transpose(1, 2))
+            return encoded, encoded_len
+
+    if 'output_dim' not in perception_config.modality_adapter and "d_model" in perception_config.modality_adapter:  # e.g., conformer encoder
+        proj = nn.Linear(perception_config.modality_adapter.d_model, perception_config.output_dim)
     else:
-        precision = 'float32' 
+        proj = nn.Identity()         
 
-    # Other relevant parameters
-    max_workspace_size = 1 << 30  # 1GB, adjust as needed
-    max_batch_size = nemo_config['model']['global_batch_size']
+    encodersModuleWrapper = EncodersModuleWrapper(
+        encoder = perception.encoder, 
+        modality_adapter = perception.modality_adapter, 
+        projector= proj)
+
+    #Test with dummy input
+    input_features = perception_config.encoder.feat_in
+    processed_signal = torch.randn(1, input_features, 128)
+    processed_signal_length = torch.tensor([128])
+    print(f"Encoders Wrapper input features: {input_features}")
+    print(f"Encoders Wrapper processed signal shape: {processed_signal.shape}")
+    print(f"Encoders Wrapper processed signal length : {processed_signal_length}")
+    print(encodersModuleWrapper(processed_signal, processed_signal_length))
+
+    onnx_file = f'{model_dir}/encoder/model.onnx'
+    export_wrapper_to_onnx(
+        wrapper= encodersModuleWrapper, 
+        input= (processed_signal, processed_signal_length),
+        filepath= onnx_file,
+        input_names=['processed_signal', 'processed_signal_length'],
+        output_names=['encoded', 'encoded_len'],
+        dynamic_axes= {
+                'processed_signal': {0: 'batch_size', 2: 'time_frames'},
+                'processed_signal_length': {0: 'batch_size'},
+            }
+        )
+    
+    build_salm_encoder_engine(
+        nemo_config= perception_config,
+        engine_dir = f'{model_dir}/encoder',
+        onnx_file= onnx_file,
+        dtype= dtype,
+        max_batch_size= max_batch_size,
+    )
+
+    #eliminate onnx file since we don't need it anymore
+    os.remove(onnx_file)
+
+   
+    #TODO: read these values from a config file
+    build_salm_decoder_engine(
+        engine_dir=f'{model_dir}/decoder',
+        nemo_checkpoint_path=f'{nemo_dir}/decoder.nemo',
+        llm_model_type = "llama",
+        tensor_parallelism_size = nemo_config['tensor_model_parallel_size'],
+        max_input_len = 512,
+        max_output_len = 256,
+        max_batch_size = max_batch_size,
+        max_multimodal_len = 512,
+        dtype = dtype,
+    )
+
+
+
+from nemo.collections.nlp.parts.nlp_overrides import NLPDDPStrategy, NLPSaveRestoreConnector
+from nemo.utils.model_utils import inject_model_parallel_rank
+import argparse
+
+def load_state_dict_from_nemo(nemo_dir, map_location):
+    save_restore_connector = NLPSaveRestoreConnector()
+
+    model_weights = f"{nemo_dir}/model_weights.ckpt"
+    model_weights = inject_model_parallel_rank(model_weights)
+    state_dict = save_restore_connector._load_state_dict_from_disk(
+        model_weights, map_location=map_location
+    )
+    return state_dict
+
+
+def get_config_and_state_dict_from_nemo(filepath, map_location, output_dir, sharded_state_dict=None):
+        cwd = os.getcwd()
+        save_restore_connector = NLPSaveRestoreConnector()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                if os.path.isfile(filepath):
+                    save_restore_connector._unpack_nemo_file(path2file=filepath, out_folder=tmpdir)
+                else:
+                    tmpdir = filepath
+
+                os.chdir(tmpdir)
+                config_yaml = "model_config.yaml"
+                model_weights_ckpt = "model_weights.ckpt"
+                
+                # find file in tmpdir that endswith "tokenizer.model"
+                for file in os.listdir(tmpdir):
+                    if file.endswith("tokenizer.model"):
+                        tokenizer = file
+                        break
+                tokenizer_path = os.path.join(tmpdir, tokenizer)
+                # copy tokenizer_path to current directory
+                os.system(f"cp {tokenizer_path} {output_dir}")
+                tokenizer_path = os.path.join(output_dir, tokenizer)
+
+                # load conf
+                with open(config_yaml) as f:
+                    conf = OmegaConf.load(f)
+                
+                os.chdir(cwd)
+                model_weights = os.path.join(tmpdir, model_weights_ckpt)
+                model_weights = inject_model_parallel_rank(model_weights)
+                state_dict = save_restore_connector._load_state_dict_from_disk(
+                    model_weights, map_location=map_location
+                )
+
+                # distributed checkpointing
+                if state_dict is None and sharded_state_dict is not None:
+                    checkpoint = dict(state_dict=sharded_state_dict)
+                    tmp_model_weights_ckpt = os.path.join(tmpdir, save_restore_connector.model_weights_ckpt)
+                    tmp_model_weights_dir = os.path.splitext(tmp_model_weights_ckpt)[0]
+                    assert os.path.isdir(tmp_model_weights_dir), f'Expected {tmp_model_weights_dir} to be a directory.'
+                    checkpoint = dist_checkpointing.load(
+                        sharded_state_dict=checkpoint,
+                        checkpoint_dir=tmp_model_weights_dir,
+                    )
+                    state_dict = checkpoint["state_dict"]
+
+                conf.tokenizer.model = tokenizer_path
+                return conf, state_dict
+            finally:
+                os.chdir(cwd)
+
+
+
+def get_perception_state_dict(state_dict):
+    perception_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith("perception."):
+            key = key.replace("perception.", "", 1)
+            perception_state_dict[key] = value
+    return perception_state_dict
+
+def build_salm_encoder_engine(
+    nemo_config,
+    engine_dir,
+    onnx_file,
+    dtype,
+    max_batch_size,
+):
+
+    output_config_file = f'{engine_dir}/config.json',
+    output_engine_file = f'{engine_dir}/rank0.trt',
+    logger.log(trt.Logger.INFO, "Building TRT encoder engine ")
+
+   # Other relevant parameters
+    #max_workspace_size = 1 << 30  # 1GB, adjust as needed
 
     builder = trt.Builder(logger)
     network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
 
-    config_args = {"precision": precision, "max_batch_size": max_batch_size}
+    config_args = nemo_config
     config_wrapper = Builder().create_builder_config(**config_args)
     config = config_wrapper.trt_builder_config
 
-    if precision == trt.DataType.HALF:
+    if dtype == trt.DataType.HALF:
         config.set_flag(trt.BuilderFlag.FP16)
-    elif precision == trt.DataType.BF16:
+    elif dtype == trt.DataType.BF16:
         config.set_flag(trt.BuilderFlag.BF16)
 
     # Set other flags based on your YAML configuration
@@ -456,170 +629,75 @@ def build_audio_trt_engines(
         else:
             logger.log(trt.Logger.INFO, "Succeeded parsing %s" % onnx_file)
 
-    #profile = builder.create_optimization_profile()
-    #input_tensor = network.get_input(0)
-    #profile.set_shape(input_tensor.name, (1, 1, 256), (1, 128, 256), (max_batch_size, 256, 256))
-    #config.add_optimization_profile(profile)
+    profile = builder.create_optimization_profile()
+
+    min_batch_size = 1
+    opt_batch_size = max(min_batch_size,int(max_batch_size/2))
+    input_features = nemo_config['perception']['encoder']['feat_in']
+    max_length = nemo_config['encoder_seq_length']
+
+    # Processed_input shape
+    min_processed_input_dims = (min_batch_size, input_features, 1)
+    opt_processed_input_dims = (opt_batch_size, input_features, max(1,int(max_length/2)))
+    max_processed_input_dims = (max_batch_size, input_features, max_length)
+    print(f"Processed input shape optimization: {min_processed_input_dims}/{opt_processed_input_dims}/{max_processed_input_dims}")
+    input_tensor_0 = network.get_input(0)
+    profile.set_shape(input_tensor_0.name, 
+                min_processed_input_dims, 
+                opt_processed_input_dims,
+                max_processed_input_dims)
+
+    # Processed_input_length shape
+    input_tensor_1 = network.get_input(1)
+    profile.set_shape(input_tensor_1.name, 
+                      trt.Dims([min_batch_size]),
+                      trt.Dims([opt_batch_size]), 
+                      trt.Dims([max_batch_size]))
+
+    config.add_optimization_profile(profile)
 
     t0 = time()
     engine_string = builder.build_serialized_network(network, config)
     t1 = time()
     if engine_string is None:
-        raise RuntimeError("Failed building %s" % (engine_file))
+        raise RuntimeError("Failed building %s" % (output_engine_file))
     else:
-        logger.log(trt.Logger.INFO, "Succeeded building %s in %d s" % (engine_file, t1 - t0))
-        with open(engine_file, 'wb') as f:
+        logger.log(trt.Logger.INFO, "Succeeded building %s in %d s" % (output_engine_file, t1 - t0))
+        with open(output_engine_file, 'wb') as f:
             f.write(engine_string)
 
-    Builder.save_config(config_wrapper, config_file)
+    Builder.save_config(config_wrapper, output_config_file)
 
-def export_audio_components_to_onnx(audio_checkpoint_path: str, model_dir: str):
-    # Load configuration
-    #cfg = load_audio_config()  # Placeholder function to load configuration
-    cfg = []
-
-    trainer = MegatronTrainerBuilder(cfg).create_trainer()
-    model = load_audio_model(cfg, trainer, audio_checkpoint_path)
-    
-    model.eval()
-
-    # Export each component
-    components = {
-        "preprocessor": model.preprocessor,
-        "encoder": model.encoder,
-        "modality_adapter": model.modality_adapter,
-        "decoder": model.decoder,
-    }
-
-    for component_name, component in components.items():
-        export_audio_component_to_onnx(component, model_dir, component_name)
-
-def load_audio_model(cfg, trainer, audio_checkpoint_path):
-    if cfg.model.from_pretrained:
-        model_cfg = ModularAudioGPTModel.from_pretrained(
-            cfg.model.from_pretrained, trainer=trainer, return_config=True
-        )
-        model_cfg = ModularAudioGPTModel.merge_inference_cfg(cfg, trainer, model_cfg)
-        model_file = ModularAudioGPTModel.from_pretrained(
-            cfg.model.from_pretrained, trainer=trainer, return_model_file=True
-        )
-        model = ModularAudioGPTModel.restore_from(
-            restore_path=model_file,
-            trainer=trainer,
-            override_config_path=model_cfg,
-            strict=False,
-            map_location="cpu",
-        )
-        if "peft" in model_cfg and model_cfg.peft.get("peft_scheme", None):
-            model.load_adapters(model_file, map_location="cpu")
-    else:
-        model_cfg = ModularAudioGPTModel.merge_inference_cfg(cfg, trainer)
-        model = ModularAudioGPTModel.restore_from(
-            restore_path=audio_checkpoint_path,
-            trainer=trainer,
-            override_config_path=model_cfg,
-            strict=False,
-            map_location="cpu",
-        )
-        model = ModularAudioGPTModel.load_adapters_for_inference(cfg, model_cfg, model)
-        model = ModularAudioGPTModel.load_audio_encoder_for_inference(cfg, model_cfg, model)
-    
-    return model
-
-def export_audio_component_to_onnx(component, model_dir, component_name):
-    output_path = os.path.join(model_dir, f"{component_name}.onnx")
-    dummy_input = component.input_example(max_batch=8, max_dim=32000)  # Adjust input example as needed
+def export_wrapper_to_onnx(
+    wrapper, input, filepath, input_names=['input'], output_names=['output'], dynamic_axes=None
+):
+    logger.log(trt.Logger.INFO, f"Exporting to ONNX format and saving in {filepath}")
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
     torch.onnx.export(
-        component,
-        dummy_input,
-        output_path,
+        model= wrapper,
+        args= input,
+        f=filepath,
+        input_names= input_names,
+        output_names= output_names,
         opset_version=17,
-        input_names=['input'],
-        output_names=['output'],
-        dynamic_axes={'input': {0: 'batch'}, 'output': {0: 'batch'}}
+        dynamic_axes=dynamic_axes or {},
     )
-    print(f"Exported {component_name} to {output_path}")
 
 
-@hydra_runner(config_path="conf", config_name="export_to_onnx_config_eval")
-def export_audio_engines(cfg) -> None:
 
-    trainer = MegatronTrainerBuilder(cfg).create_trainer()
+if __name__ == "__main__":
 
-    if cfg.model.from_pretrained:
-        # Load model from NGC or HuggingFace
-        logging.info(f"Loading model from cloud: {cfg.model.from_pretrained}")
-        model_cfg = ModularAudioGPTModel.from_pretrained(
-            cfg.model.from_pretrained, trainer=trainer, return_config=True
-        )
-        model_cfg = ModularAudioGPTModel.merge_inference_cfg(cfg, trainer, model_cfg)
-        model_file = ModularAudioGPTModel.from_pretrained(
-            cfg.model.from_pretrained, trainer=trainer, return_model_file=True
-        )
-        model = ModularAudioGPTModel.restore_from(
-            restore_path=model_file,
-            trainer=trainer,
-            override_config_path=model_cfg,
-            strict=False,
-            map_location="cpu",
-        )
-        if "peft" in model_cfg and model_cfg.peft.get("peft_scheme", None):
-            # need this due to the way that MegatronGPTSFTModel doesn't load adapters in model initialization
-            model.load_adapters(model_file, map_location="cpu")
-    else:
-        # Load model from a local file
-        model_cfg = ModularAudioGPTModel.merge_inference_cfg(cfg, trainer)
-        model = ModularAudioGPTModel.restore_from(
-            restore_path=cfg.model.restore_from_path,
-            trainer=trainer,
-            override_config_path=model_cfg,
-            strict=False,
-            map_location="cpu",
-        )
-        model = ModularAudioGPTModel.load_adapters_for_inference(cfg, model_cfg, model)
-        model = ModularAudioGPTModel.load_audio_encoder_for_inference(cfg, model_cfg, model)
+    parser = argparse.ArgumentParser(description="Build multimodal engine")
+    parser.add_argument("--model_dir", type=str, help="Path to the model directory, where the engines will be saved")
+    parser.add_argument("--checkpoint_path", type=str, help="Path to the nemo checkpoint files")
+    parser.add_argument("--model_type", type=str, default="neva", help="Model type (default: neva)")
+    parser.add_argument("--max_batch_size", type=int, default=1, help="Maximum batch size (default: 1)")
 
-    model.eval()
+    args = parser.parse_args()
 
-    #Export the models
-
-    models_to_export = {
-        'modality_adapter' : model.perception.modality_adapter,
-        'audio_encoder' : model.perception.encoder,
-    }
-
-    engine_path = f"onnx/"
-    for tag, model_to_export in models_to_export.items():
-        model_name = model_to_export.__class__.__name__ 
-        model_path = f"{engine_path}/{cfg.model.export_to_path}_{model_name}_{tag}"
-
-        logging.info("################################################################################")
-        logging.info(f"Exporting to {model_path}...")
-
-        os.makedirs(model_path, exist_ok=True)
-        model_file_path= f"{model_path}/model.onnx"
-        
-        #NOTE: Export fails with max_dim>4096 probably due to memory alloc error
-        input_example = model_to_export.input_example(max_batch = 8, max_dim = 4096) 
-
-        model_to_export.export(
-            output=model_file_path,
-            input_example=input_example,
-            verbose=False,
-            onnx_opset_version=17,
-            dynamic_axes={},
-        )
-
-        # Save the config to a json file
-        config_file_path= f"{model_path}/config.json"
-        config_dict = OmegaConf.to_container(cfg.model, resolve=False)
-        json_config = json.dumps(config_dict, indent=4)
-
-        with open(config_file_path, "w") as json_file:
-            json_file.write(json_config)
-
-
-print("Starting")
-build_audio_engine('./audio_model','./speechllm_fc_llama2_7b.nemo','salm')
-
-    
+    build_multimodal_engine(
+        model_dir=args.model_dir,
+        checkpoint_path=args.checkpoint_path,
+        model_type=args.model_type,
+        max_batch_size=args.max_batch_size,
+    )
