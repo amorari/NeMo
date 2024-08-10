@@ -51,6 +51,7 @@ python build.py --model_dir trt_engines --checkpoint_path nemo_model --model_typ
 
 After we should obtain the engines as follows:
 
+```
 trt_engines
     |___encoder
     |       |____config.json
@@ -58,5 +59,5 @@ trt_engines
     |___decoder
             |____config.json
             |____rank0.trt
-
+```
 
